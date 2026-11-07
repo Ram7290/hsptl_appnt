@@ -1,0 +1,167 @@
+const { sql, getPool } = require('../config/db');
+
+/* Locking query: takes an update lock on the slot row and holds it (with
+ * serializable range semantics) until this transaction commits or rolls
+ * back. A concurrent booking for the same slot blocks here, then sees
+ * the committed appointment row and gets a 409. */
+const LOCK_SLOT_SQL = `
+    SELECT SlotId
+    FROM dbo.AppointmentSlots WITH (UPDLOCK, HOLDLOCK)
+    WHERE SlotId = @slotId;`;
+
+const CHECK_PATIENT_SQL = `
+    SELECT PatientId
+    FROM dbo.Patients
+    WHERE PatientId = @patientId;`;
+
+const CHECK_ALREADY_BOOKED_SQL = `
+    SELECT AppointmentId, SlotId, PatientId, BookedAt
+    FROM dbo.Appointments
+    WHERE SlotId = @slotId;`;
+
+const INSERT_APPOINTMENT_SQL = `
+    INSERT INTO dbo.Appointments (SlotId, PatientId)
+    OUTPUT INSERTED.AppointmentId, INSERTED.SlotId, INSERTED.PatientId, INSERTED.BookedAt
+    VALUES (@slotId, @patientId);`;
+
+/* SQL Server error numbers that mean a unique-constraint violation */
+const DUPLICATE_KEY_ERRORS = new Set([2601, 2627]);
+
+/* SQL Server error number for deadlock (a possible transient failure) */
+const DEADLOCK_ERROR = 1205;
+
+function isValidId(value) {
+    // Rejects missing values, strings, floats, booleans, zero, negatives
+    // and values beyond Number.MAX_SAFE_INTEGER.
+    return Number.isSafeInteger(value) && value > 0;
+}
+
+function respond(res, status, body) {
+    return res.status(status).json(body);
+}
+
+/* Safe client-side messages (no SQL text, stack traces or driver errors). */
+const MESSAGES = {
+    invalidId: 'Valid positive integer slotId and patientId are required',
+    slotNotFound: 'Appointment slot not found',
+    patientNotFound: 'Patient not found',
+    conflict: 'This appointment slot is already booked',
+    serverError: 'An unexpected server error occurred. Please try again later.'
+};
+
+async function bookAppointment(req, res) {
+    const body = req.body || {};
+    const slotId = body.slotId;
+    const patientId = body.patientId;
+
+    // 1. Validate before opening any transaction or consuming a pool
+    //    connection - invalid requests never touch the database.
+    if (!isValidId(slotId) || !isValidId(patientId)) {
+        return respond(res, 400, { success: false, message: MESSAGES.invalidId });
+    }
+
+    let pool;
+    try {
+        pool = await getPool();
+    } catch (err) {
+        console.error('Could not connect to SQL Server:', err.message);
+        return respond(res, 500, { success: false, message: MESSAGES.serverError });
+    }
+
+    // 2. Acquire a pool connection and begin the transaction. All booking
+    //    database work (slot lock, checks, insert) happens inside it.
+    const transaction = new sql.Transaction(pool);
+    let began = false;
+    let rolledBack = false;
+    transaction.on('rollback', () => { rolledBack = true; });
+
+    try {
+        await transaction.begin();
+        began = true;
+
+        const request = new sql.Request(transaction);
+
+        // 3. Lock the slot row inside the transaction.
+        const slotResult = await request
+            .input('slotId', sql.Int, slotId)
+            .query(LOCK_SLOT_SQL);
+
+        if (slotResult.recordset.length === 0) {
+            await transaction.rollback();
+            return respond(res, 404, { success: false, message: MESSAGES.slotNotFound });
+        }
+
+        // 4. Check that the patient exists.
+        const patientResult = await new sql.Request(transaction)
+            .input('patientId', sql.Int, patientId)
+            .query(CHECK_PATIENT_SQL);
+
+        if (patientResult.recordset.length === 0) {
+            await transaction.rollback();
+            return respond(res, 404, { success: false, message: MESSAGES.patientNotFound });
+        }
+
+        // 5. Availability check after the lock: if another transaction
+        //    already committed a booking, we waited on the slot lock and
+        //    now see the row.
+        const bookingResult = await new sql.Request(transaction)
+            .input('slotId', sql.Int, slotId)
+            .query(CHECK_ALREADY_BOOKED_SQL);
+
+        if (bookingResult.recordset.length > 0) {
+            await transaction.rollback();
+            return respond(res, 409, { success: false, message: MESSAGES.conflict });
+        }
+
+        // 6. Insert inside the same transaction.
+        const insertResult = await new sql.Request(transaction)
+            .input('slotId', sql.Int, slotId)
+            .input('patientId', sql.Int, patientId)
+            .query(INSERT_APPOINTMENT_SQL);
+
+        const booked = insertResult.recordset[0];
+
+        // 7. Only return success after the commit succeeds.
+        await transaction.commit();
+
+        return respond(res, 201, {
+            success: true,
+            message: 'Appointment booked successfully',
+            data: {
+                AppointmentId: booked.AppointmentId,
+                SlotId: booked.SlotId,
+                PatientId: booked.PatientId,
+                BookedAt: booked.BookedAt // generated by SQL Server
+            }
+        });
+    } catch (err) {
+        // Roll back only if the transaction actually began and has not
+        // already been rolled back. Never swallow a rollback failure.
+        if (began && !rolledBack) {
+            try {
+                await transaction.rollback();
+            } catch (rollbackErr) {
+                console.error('Rollback failed:', rollbackErr.message);
+            }
+        }
+
+        if (DUPLICATE_KEY_ERRORS.has(err.number)) {
+            // Safety net: if the lock somehow did not serialize two
+            // requests, the unique constraint rejects the second insert.
+            console.warn(`Duplicate-key race caught for slot ${slotId} (SQL error ${err.number}).`);
+            return respond(res, 409, { success: false, message: MESSAGES.conflict });
+        }
+
+        if (err.number === DEADLOCK_ERROR) {
+            // Deadlock is a possible transient failure (see README). A
+            // bounded retry could be added, but it is not implemented here.
+            console.error(`Deadlock (SQL error ${DEADLOCK_ERROR}) while booking slot ${slotId}. A safe retry strategy would be appropriate here.`);
+        } else {
+            console.error('Booking transaction failed:', err);
+        }
+
+        return respond(res, 500, { success: false, message: MESSAGES.serverError });
+    }
+}
+
+module.exports = { bookAppointment };
